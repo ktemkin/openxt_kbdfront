@@ -53,6 +53,7 @@ struct openxt_kbd_info {
 	char phys[32];
 };
 
+//Forward declarations.
 static int  oxtkbd_remove(struct xenbus_device *);
 static int  oxtkbd_connect_backend(struct xenbus_device *, struct openxt_kbd_info *);
 static void oxtkbd_disconnect_backend(struct openxt_kbd_info *);
@@ -190,7 +191,52 @@ static irqreturn_t input_handler(int rq, void *dev_id)
 }
 
 /**
+ * Registers a new Xen Virtual Keyboard Device.
+ *
+ * @param info The information structure for the combined input device
+ *		for which this device should belong to.
+ * @param name The new device's name, as reported to the user.
+ */
+static struct input_dev * __allocate_keyboard_device(struct openxt_kbd_info *info, 
+		char * name)
+{
+	int i, ret;
+
+	//Allocate a new input device.
+	struct input_dev *kbd = input_allocate_device();
+	if (!kbd)
+		return NULL;
+
+	//Initailize its basic device information...
+	kbd->name       = name;
+	kbd->phys       = info->phys;
+	kbd->id.bustype = BUS_PCI;
+	kbd->id.vendor  = 0x5853;
+	kbd->id.product = 0xffff;
+
+	//Register all of the keys we'll want the keyboard device to handle.
+	__set_bit(EV_KEY, kbd->evbit);
+	for (i = KEY_ESC; i < KEY_UNKNOWN; i++)
+		__set_bit(i, kbd->keybit);
+	for (i = KEY_OK; i < KEY_MAX; i++)
+		__set_bit(i, kbd->keybit);
+
+	//And finally, register the device with the input subsystem.
+	ret = input_register_device(kbd);
+	if (ret) {
+		input_free_device(kbd);
+		return NULL;
+	}
+
+	return kbd;
+}
+
+/**
  * Creates a new Xen Virtrual Pointer Device.
+ *
+ * @param info The information structure for the combined input device
+ *		for which this device should belong to.
+ * @param name The new device's name, as reported to the user.
  */ 
 static struct input_dev * __allocate_pointer_device(struct openxt_kbd_info *info, 
 		char * name, int is_absolute)
@@ -240,51 +286,49 @@ static struct input_dev * __allocate_pointer_device(struct openxt_kbd_info *info
 	return ptr;
 }
 
-static int xenkbd_probe(struct xenbus_device *dev,
-				  const struct xenbus_device_id *id)
+/**
+ * Creates a new OpenXT combined input device, if possible.
+ *
+ * @param dev The XenBus device to which the new combined input device will belong.
+ * @param id Information regarding the relevant xenbus device.
+ * 
+ * @return 0 on success, or an error code on failure.
+ */
+static int oxtkbd_probe(struct xenbus_device *dev, const struct xenbus_device_id *id)
 {
-	int ret, i;
+	int ret;
 	struct openxt_kbd_info *info;
-	struct input_dev *kbd;
 
+	//Create a new information structure for our new combined input device.
+	//This will represent the device "object", and store all of the device's
+	//state.
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
 	if (!info) {
 		xenbus_dev_fatal(dev, -ENOMEM, "allocating info structure");
 		return -ENOMEM;
 	}
+
+	//Associate the new information structure with the core XenBus device.
 	dev_set_drvdata(&dev->dev, info);
+
+	//Initialize the information structure.
 	info->xbdev = dev;
-	info->irq = -1;
-	info->gref = -1;
+	info->irq   = -1;
+	info->gref  = -1;
 	snprintf(info->phys, sizeof(info->phys), "xenbus/%s", dev->nodename);
 
+	//To communicate with the backend, we'll use a small "shared page"
+	//as a ring buffer. We'll allocate that page now, and share it with
+	//the when it tries to connect.
 	info->page = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
 	if (!info->page)
 		goto error_nomem;
 
-	/* keyboard */
-	kbd = input_allocate_device();
-	if (!kbd)
+	//Allocate a new keyboard device, which will handle all keypresses and
+	//button presses.
+	info->kbd = __allocate_keyboard_device(info, "Xen Virtual Keyboard");
+	if(!info->kbd)
 		goto error_nomem;
-	kbd->name = "Xen Virtual Keyboard";
-	kbd->phys = info->phys;
-	kbd->id.bustype = BUS_PCI;
-	kbd->id.vendor = 0x5853;
-	kbd->id.product = 0xffff;
-
-	__set_bit(EV_KEY, kbd->evbit);
-	for (i = KEY_ESC; i < KEY_UNKNOWN; i++)
-		__set_bit(i, kbd->keybit);
-	for (i = KEY_OK; i < KEY_MAX; i++)
-		__set_bit(i, kbd->keybit);
-
-	ret = input_register_device(kbd);
-	if (ret) {
-		input_free_device(kbd);
-		xenbus_dev_fatal(dev, ret, "input_register_device(kbd)");
-		goto error;
-	}
-	info->kbd = kbd;
 
 	//Allocate a new relative pointer, for our relative events...
 	info->ptr = __allocate_pointer_device(info, "Xen Relative Pointer", false);
@@ -301,6 +345,7 @@ static int xenkbd_probe(struct xenbus_device *dev,
 	if (ret < 0)
 		goto error;
 
+	//Indicate success.
 	return 0;
 
  error_nomem:
@@ -311,46 +356,87 @@ static int xenkbd_probe(struct xenbus_device *dev,
 	return ret;
 }
 
-static int xenkbd_resume(struct xenbus_device *dev)
+/**
+ * Resumes use of the input device after sleep/S3.
+ *
+ * @param dev The device to be resumed.
+ */
+static int oxtkbd_resume(struct xenbus_device *dev)
 {
+	//Get a reference to the connection's information structure.
 	struct openxt_kbd_info *info = dev_get_drvdata(&dev->dev);
 
+	//Upon resume, we'll want to tear down our existing connection
+	//and reconnect.
 	oxtkbd_disconnect_backend(info);
+
+	//Ensure that no events survive past S3.
 	memset(info->page, 0, PAGE_SIZE);
+
 	return oxtkbd_connect_backend(dev, info);
 }
 
+
+/**
+ * Removes the provided OpenXT input connection from the system.
+ * 
+ * @param dev There device to be removed.
+ */
 static int oxtkbd_remove(struct xenbus_device *dev)
 {
+	//Get a reference to the connection's information structure.
 	struct openxt_kbd_info *info = dev_get_drvdata(&dev->dev);
 
+	//Disconnect ourself from the backend...
 	oxtkbd_disconnect_backend(info);
+
+	//...tear down each of our actual input devices...
 	if (info->kbd)
 		input_unregister_device(info->kbd);
 	if (info->ptr)
 		input_unregister_device(info->ptr);
+	if (info->absolute_pointer)
+		input_unregister_device(info->ptr);
+
+	//... free our shared page...
 	free_page((unsigned long)info->page);
+
+	//... finally free our information structure.
 	kfree(info);
 	return 0;
 }
 
+
+/**
+ * Connect the OpenXT input device to the corresponding backend.
+ *
+ * @param dev The device to be connected.
+ * @param info The information structure that corresponds to the given device.
+ *
+ * @return int Zero on success, or an error code on failure.
+ */
 static int oxtkbd_connect_backend(struct xenbus_device *dev,
 				  struct openxt_kbd_info *info)
 {
 	int ret, evtchn;
 	struct xenbus_transaction xbt;
 
-	ret = gnttab_grant_foreign_access(dev->otherend_id,
-	                                  virt_to_mfn(info->page), 0);
+	//To communicate with the backend, we'll share a single page of memory
+	//We'll start this process by granting out our "shared page".
+	ret = gnttab_grant_foreign_access(dev->otherend_id, virt_to_mfn(info->page), 0);
 	if (ret < 0)
 		return ret;
 	info->gref = ret;
 
+	//Next, we'll need to create an event channel we can use to signal that data
+	//has changed in our shared page.
 	ret = xenbus_alloc_evtchn(dev, &evtchn);
 	if (ret)
 		goto error_grant;
-	ret = bind_evtchn_to_irqhandler(evtchn, input_handler,
-					0, dev->devicetype, info);
+
+	//Bind our input handler to our event channel-- ensuring we're recieve any
+	//"new data" notifications.
+	ret = bind_evtchn_to_irqhandler(evtchn, input_handler, 0, dev->devicetype, info);
 	if (ret < 0) {
 		xenbus_dev_fatal(dev, ret, "bind_evtchn_to_irqhandler");
 		goto error_evtchan;
@@ -358,30 +444,53 @@ static int oxtkbd_connect_backend(struct xenbus_device *dev,
 	info->irq = ret;
 
  again:
+
+	//Now that we've set up our shared assets, we'll need to communicate them
+	//to the backend. First, we'll start a xenbus transaction, so we can dump
+	//all of our data into the XenStore simultaneously.
 	ret = xenbus_transaction_start(&xbt);
 	if (ret) {
 		xenbus_dev_fatal(dev, ret, "starting transaction");
 		goto error_irqh;
 	}
-	ret = xenbus_printf(xbt, dev->nodename, "page-ref", "%lu",
-			    virt_to_mfn(info->page));
+
+	//Provide a direct reference to the page. This allows backends that want
+	//to use foreign mappings (i.e. legacy backends) to map in the shared page
+	//without touching grants.
+	ret = xenbus_printf(xbt, dev->nodename, "page-ref", "%lu", virt_to_mfn(info->page));
 	if (ret)
 		goto error_xenbus;
+
+	//And provide our grant reference. This is the preferred way of getting the
+	//shared page.
 	ret = xenbus_printf(xbt, dev->nodename, "page-gref", "%u", info->gref);
 	if (ret)
 		goto error_xenbus;
-	ret = xenbus_printf(xbt, dev->nodename, "event-channel", "%u",
-			    evtchn);
+
+	//Provide the number for our event channel, so the backend can signal
+	//new informatino to us.
+	ret = xenbus_printf(xbt, dev->nodename, "event-channel", "%u", evtchn);
 	if (ret)
 		goto error_xenbus;
+
+	//Attempt to apply all of our changes at once.
 	ret = xenbus_transaction_end(xbt, 0);
+
+	//If our transaction failed...
 	if (ret) {
+
+		//... it may have been because the XenStore was busy. If this is the case,
+		//repeat out transaction until we succeed, or hit an error.
 		if (ret == -EAGAIN)
 			goto again;
+
+		//Otherwise, we couldn't connect. Bail out!
 		xenbus_dev_fatal(dev, ret, "completing transaction");
 		goto error_irqh;
 	}
 
+	//Finally, switch our state to "intialized", hopefully cueing the backend
+	//to connect.
 	xenbus_switch_state(dev, XenbusStateInitialised);
 	return 0;
 
@@ -399,21 +508,36 @@ static int oxtkbd_connect_backend(struct xenbus_device *dev,
 	return ret;
 }
 
+
+/**
+ * Handles a backend disconnect.
+ *
+ * @param info The information structure for the device to be disconnected.
+ */
 static void oxtkbd_disconnect_backend(struct openxt_kbd_info *info)
 {
+
+	//If we had an input IRQ registered, tear it down.
 	if (info->irq >= 0)
 		unbind_from_irqhandler(info->irq, info);
 	info->irq = -1;
+
+	//... and if we have a shared page for our ring, tear it down.
 	if (info->gref >= 0)
 		gnttab_end_foreign_access(info->gref, 0, 0UL);
 	info->gref = -1;
 }
 
-static void xenkbd_backend_changed(struct xenbus_device *dev,
+
+/**
+ * Handle a change to the keyboard device's backend. 
+ * This effectively moves us through the XenBus negotiation FSM.
+ */
+static void oxtkbd_backend_changed(struct xenbus_device *dev,
 				   enum xenbus_state backend_state)
 {
+	int val;
 	struct openxt_kbd_info *info = dev_get_drvdata(&dev->dev);
-	int ret, val;
 
 	switch (backend_state) {
 	case XenbusStateInitialising:
@@ -425,17 +549,6 @@ static void xenkbd_backend_changed(struct xenbus_device *dev,
 
 	case XenbusStateInitWait:
 InitWait:
-		ret = xenbus_scanf(XBT_NIL, info->xbdev->otherend,
-				   "feature-abs-pointer", "%d", &val);
-		if (ret < 0)
-			val = 0;
-		if (val) {
-			ret = xenbus_printf(XBT_NIL, info->xbdev->nodename,
-					    "request-abs-pointer", "1");
-			if (ret)
-				pr_warning("xenkbd: can't request abs-pointer");
-		}
-
 		xenbus_switch_state(dev, XenbusStateConnected);
 		break;
 
@@ -448,7 +561,9 @@ InitWait:
 		if (dev->state != XenbusStateConnected)
 			goto InitWait; /* no InitWait seen yet, fudge it */
 
-		/* Set input abs params to match backend screen res */
+		//Once we connect, try to adjust the screen width and height
+		//to match the width and height stored in the XenStore.
+		
 		if (xenbus_scanf(XBT_NIL, info->xbdev->otherend,
 				 "width", "%d", &val) > 0)
 			input_set_abs_params(info->ptr, ABS_X, 0, val, 0, 0);
@@ -462,6 +577,7 @@ InitWait:
 	case XenbusStateClosed:
 		if (dev->state == XenbusStateClosed)
 			break;
+
 		/* Missed the backend's CLOSING state -- fallthrough */
 	case XenbusStateClosing:
 		xenbus_frontend_closed(dev);
@@ -469,41 +585,63 @@ InitWait:
 	}
 }
 
-static const struct xenbus_device_id xenkbd_ids[] = {
+/**
+ * For now, we'll provide a backwards-compatible alternative to
+ * xen_kbdfront that can support additional frontend capabilities.
+ * This may change in the future.
+ */ 
+static const struct xenbus_device_id oxtkbd_ids[] = {
 	{ "vkbd" },
 	{ "" }
 };
 
-static struct xenbus_driver xenkbd_driver = {
-	.ids = xenkbd_ids,
-	.probe = xenkbd_probe,
-	.remove = oxtkbd_remove,
-	.resume = xenkbd_resume,
-	.otherend_changed = xenkbd_backend_changed,
+
+/**
+ * Specify each of the XenBus handlers for our new input driver.
+ */
+static struct xenbus_driver oxtkbd_driver = {
+	.ids              = oxtkbd_ids,
+	.probe            = oxtkbd_probe,
+	.remove           = oxtkbd_remove,
+	.resume           = oxtkbd_resume,
+	.otherend_changed = oxtkbd_backend_changed,
 };
 
-static int __init xenkbd_init(void)
+
+/**
+ * Initializes the OpenXT input module.
+ */
+static int __init oxtkbd_init(void)
 {
+	//If we're not on Xen, we definitely don't apply.
 	if (!xen_domain())
 		return -ENODEV;
 
-	/* Nothing to do if running in dom0. */
+	//For now, there's no sense in running this from dom0,
+	//as it has direct access to the keyboard. This may change,
+	//depending on disaggregation specifics.
 	if (xen_initial_domain())
 		return -ENODEV;
 
+	//If we can't use the XenBus, fail out.
 	if (!xen_has_pv_devices())
 		return -ENODEV;
 
-	return xenbus_register_frontend(&xenkbd_driver);
+	//Otheriwse, register our driver!
+	return xenbus_register_frontend(&oxtkbd_driver);
 }
 
-static void __exit xenkbd_cleanup(void)
+
+/**
+ * Tears down the OpenXT input module.
+ */
+static void __exit oxtkbd_cleanup(void)
 {
-	xenbus_unregister_driver(&xenkbd_driver);
+	xenbus_unregister_driver(&oxtkbd_driver);
 }
 
-module_init(xenkbd_init);
-module_exit(xenkbd_cleanup);
+module_init(oxtkbd_init);
+module_exit(oxtkbd_cleanup);
 
-MODULE_DESCRIPTION("Xen virtual keyboard/pointer device frontend with touch support");
+MODULE_DESCRIPTION("OpenXT Paravirtual Input Device");
 MODULE_LICENSE("GPL");
