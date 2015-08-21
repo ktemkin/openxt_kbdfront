@@ -1,0 +1,12 @@
+.built-in.o.cmd
+.openxt-kbdfront.ko.cmd
+.openxt-kbdfront.mod.o.cmd
+.openxt-kbdfront.o.cmd
+.tmp_versions/
+Module.symvers
+built-in.o
+modules.order
+openxt-kbdfront.ko
+openxt-kbdfront.mod.c
+openxt-kbdfront.mod.o
+openxt-kbdfront.o
