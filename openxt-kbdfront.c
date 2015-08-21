@@ -12,51 +12,7 @@
  *  more details.
  */
 
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/module.h>
-#include <linux/input.h>
-#include <linux/slab.h>
-
-#include <asm/xen/hypervisor.h>
-
-#include <xen/xen.h>
-#include <xen/events.h>
-#include <xen/page.h>
-#include <xen/grant_table.h>
-#include <xen/interface/grant_table.h>
-#include <xen/interface/io/fbif.h>
-#include <xen/interface/io/kbdif.h>
-#include <xen/xenbus.h>
-#include <xen/platform_pci.h>
-
 #include "oxt_kbdif.h"
-
-/**
- * Data structure describing the OXT-KBD device state.
- */
-struct openxt_kbd_info {
-
-	//The raw keyboard-- used to send key events.
-	struct input_dev *kbd;
-	struct input_dev *ptr;
-	
-	//The input device used to deliver any absolute events.
-	struct input_dev *absolute_pointer;
-
-	struct xenkbd_page *page;
-	int gref;
-	int irq;
-	struct xenbus_device *xbdev;
-	char phys[32];
-};
-
-//Forward declarations.
-static int  oxtkbd_remove(struct xenbus_device *);
-static int  oxtkbd_connect_backend(struct xenbus_device *, struct openxt_kbd_info *);
-static void oxtkbd_disconnect_backend(struct openxt_kbd_info *);
 
 /**
  * Handler for relative motion events.
@@ -66,7 +22,7 @@ static void oxtkbd_disconnect_backend(struct openxt_kbd_info *);
  * @param event The relative motion event to be handled. 
  */
 static void __handle_relative_motion(struct openxt_kbd_info *info, 
-		union xenkbd_in_event *event)
+		union oxtkbd_in_event *event)
 {
 	//Pass the relative movement on to evdev.
 	input_report_rel(info->ptr, REL_X, event->motion.rel_x);
@@ -89,7 +45,7 @@ static void __handle_relative_motion(struct openxt_kbd_info *info,
  * @param event The absolute motion event to be handled. 
  */
 static void __handle_absolute_motion(struct openxt_kbd_info *info, 
-		union xenkbd_in_event *event) 
+		union oxtkbd_in_event *event) 
 {
 	//Send the new absolute coordinate...
 	input_report_abs(info->absolute_pointer, ABS_X, event->pos.abs_x);
@@ -104,6 +60,88 @@ static void __handle_absolute_motion(struct openxt_kbd_info *info,
 
 
 /**
+ * Handler for multitouch touch events.
+ *
+ * @param info The device information structure for the relevant PV input
+ *		device.
+ * @param event The touch event to be handled.
+ */
+static void __handle_touch_down(struct openxt_kbd_info *info, 
+		union oxtkbd_in_event *event) 
+{
+	//Send an indication that the given finger has been pressed...
+	input_mt_slot(info->absolute_pointer, event->touch_move.id);
+	input_mt_report_slot_state(info->absolute_pointer, MT_TOOL_FINGER, 1);
+
+	//If this was the first finger to be pressed, also send the button touch ID.
+	if(event->touch_move.id == 0) {
+		input_report_key(info->absolute_pointer, BTN_TOUCH, 1);	
+	}
+}
+
+
+
+/**
+ * Handler for multitouch touch events.
+ *
+ * @param info The device information structure for the relevant PV input
+ *		device.
+ * @param event The touch event to be handled.
+ */
+static void __handle_touch_movement(struct openxt_kbd_info *info, 
+		union oxtkbd_in_event *event) 
+{
+	//Send the slot number, which determines which "finger" is providing
+	//the touch event.
+	input_mt_slot(info->absolute_pointer, event->touch_move.id);
+
+	//... the multi-touch coordinates...
+	input_report_abs(info->absolute_pointer, ABS_MT_POSITION_X, event->touch_move.abs_x);
+	input_report_abs(info->absolute_pointer, ABS_MT_POSITION_Y, event->touch_move.abs_y);
+
+	//... and the regular touch coordinates.
+	//TODO: Determine when to send these?
+	input_report_abs(info->absolute_pointer, ABS_X, event->touch_move.abs_x);
+	input_report_abs(info->absolute_pointer, ABS_Y, event->touch_move.abs_y);
+
+}
+
+
+/**
+ * Handler for multitouch touch events.
+ *
+ * @param info The device information structure for the relevant PV input
+ *		device.
+ * @param event The touch event to be handled.
+ */
+static void __handle_touch_up(struct openxt_kbd_info *info, 
+		union oxtkbd_in_event *event) 
+{
+	//Send an indication that the given finger has been pressed...
+	input_mt_slot(info->absolute_pointer, event->touch_move.id);
+	input_mt_report_slot_state(info->absolute_pointer, MT_TOOL_FINGER, 0);
+
+	//If this was the first finger to be pressed, also send the button touch ID.
+	if(event->touch_move.id == 0) {
+		input_report_key(info->absolute_pointer, BTN_TOUCH, 0);	
+	}
+}
+
+
+/**
+ * Handle touch framing events.
+ *
+ * @param info The device information structure for the relevant PV input
+ *		device.
+ * @param event The touch event to be handled.
+ */
+static void __handle_touch_framing(struct openxt_kbd_info *info, 
+		union oxtkbd_in_event *event) 
+{
+	input_sync(info->absolute_pointer);
+}
+
+/**
  * Handler for keypress events, including mouse button "keys".
  *
  * @param info The device information structure for the relevant PV input
@@ -111,7 +149,7 @@ static void __handle_absolute_motion(struct openxt_kbd_info *info,
  * @param event The keypress event to be handled. 
  */
 static void __handle_key_or_button_press(struct openxt_kbd_info *info, 
-		union xenkbd_in_event *event)
+		union oxtkbd_in_event *event)
 {
 	struct input_dev *dev = NULL;
 
@@ -159,7 +197,7 @@ static irqreturn_t input_handler(int rq, void *dev_id)
 
 	//For each outstanding event in the ringbuffer...
 	for (cons = page->in_cons; cons != prod; cons++) {
-		union xenkbd_in_event *event;
+		union oxtkbd_in_event *event;
 
 		//Get a reference to the current event.
 		event = &OXT_KBD_IN_RING_REF(page, cons);
@@ -177,6 +215,23 @@ static irqreturn_t input_handler(int rq, void *dev_id)
 		case OXT_KBD_TYPE_POS:
 			__handle_absolute_motion(info, event);
 			break;
+
+		case OXT_KBD_TYPE_TOUCH_DOWN:
+			__handle_touch_down(info, event);
+			break;
+
+		case OXT_KBD_TYPE_TOUCH_UP:
+			__handle_touch_up(info, event);
+			break;
+
+		case OXT_KBD_TYPE_TOUCH_MOVE:
+			__handle_touch_movement(info, event);
+			break;
+
+		case OXT_KBD_TYPE_TOUCH_FRAME:
+			__handle_touch_framing(info, event);
+			break;
+
 		}
 	}
 
@@ -261,6 +316,9 @@ static struct input_dev * __allocate_pointer_device(struct openxt_kbd_info *info
 		__set_bit(EV_ABS, ptr->evbit);
 		input_set_abs_params(ptr, ABS_X, 0, XENFB_WIDTH, 0, 0);
 		input_set_abs_params(ptr, ABS_Y, 0, XENFB_HEIGHT, 0, 0);
+		
+		//Accept touches, as well.
+		input_set_capability(ptr, EV_KEY, BTN_TOUCH);
 	} 
 	//Otherwise, register it as providing relative ones.
 	else {
