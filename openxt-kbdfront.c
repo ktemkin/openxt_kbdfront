@@ -1,5 +1,5 @@
 /*
- * Xen para-virtual input device
+ * OpenXT para-virtual input device
  *
  * Copyright (C) 2005 Anthony Liguori <aliguori@us.ibm.com>
  * Copyright (C) 2006-2008 Red Hat, Inc., Markus Armbruster <armbru@redhat.com>
@@ -32,7 +32,14 @@
 #include <xen/xenbus.h>
 #include <xen/platform_pci.h>
 
+#include "oxt_kbdif.h"
+
+/**
+ * Data structure describing the OXT-KBD device state.
+ */
 struct openxt_kbd_info {
+
+	//The raw keyboard-- used to send key events.
 	struct input_dev *kbd;
 	struct input_dev *ptr;
 	
@@ -46,68 +53,139 @@ struct openxt_kbd_info {
 	char phys[32];
 };
 
-static int xenkbd_remove(struct xenbus_device *);
-static int xenkbd_connect_backend(struct xenbus_device *, struct openxt_kbd_info *);
-static void xenkbd_disconnect_backend(struct openxt_kbd_info *);
+static int  oxtkbd_remove(struct xenbus_device *);
+static int  oxtkbd_connect_backend(struct xenbus_device *, struct openxt_kbd_info *);
+static void oxtkbd_disconnect_backend(struct openxt_kbd_info *);
 
-/*
- * Note: if you need to send out events, see xenfb_do_update() for how
- * to do that.
+/**
+ * Handler for relative motion events.
+ *
+ * @param info The device information structure for the relevant PV input
+ *		device.
+ * @param event The relative motion event to be handled. 
  */
+static void __handle_relative_motion(struct openxt_kbd_info *info, 
+		union xenkbd_in_event *event)
+{
+	//Pass the relative movement on to evdev.
+	input_report_rel(info->ptr, REL_X, event->motion.rel_x);
+	input_report_rel(info->ptr, REL_Y, event->motion.rel_y);
 
+	//If the event has a Z-axis motion (a scroll wheel event),
+	//send that as well.
+	if (event->motion.rel_z)
+		input_report_rel(info->ptr, REL_WHEEL, -event->motion.rel_z);
+
+	input_sync(info->ptr);
+}
+
+
+/**
+ * Handler for pure absolute (e.g. touchpad) movements.
+ *
+ * @param info The device information structure for the relevant PV input
+ *		device.
+ * @param event The absolute motion event to be handled. 
+ */
+static void __handle_absolute_motion(struct openxt_kbd_info *info, 
+		union xenkbd_in_event *event) 
+{
+	//Send the new absolute coordinate...
+	input_report_abs(info->absolute_pointer, ABS_X, event->pos.abs_x);
+	input_report_abs(info->absolute_pointer, ABS_Y, event->pos.abs_y);
+
+	//... and if we have a scroll wheel event, send that too.
+	if (event->pos.rel_z)
+		input_report_rel(info->absolute_pointer, REL_WHEEL, -event->pos.rel_z);
+
+	input_sync(info->absolute_pointer);
+}
+
+
+/**
+ * Handler for keypress events, including mouse button "keys".
+ *
+ * @param info The device information structure for the relevant PV input
+ *		device.
+ * @param event The keypress event to be handled. 
+ */
+static void __handle_key_or_button_press(struct openxt_kbd_info *info, 
+		union xenkbd_in_event *event)
+{
+			struct input_dev *dev = NULL;
+
+			//If this event is corresponds to a keyboard event, 
+			//send it via the keyboard device.
+			if (test_bit(event->key.keycode, info->kbd->keybit))
+				dev = info->kbd;
+
+			//If it corresponds to a mouse event, send it via the mouse
+			//device. TODO: Possibly differentiate between ABS and REL presses?
+			if (test_bit(event->key.keycode, info->ptr->keybit))
+				dev = info->ptr;
+
+			//If we found a device to send the key via, send it!
+			if (dev) {
+				input_report_key(dev, event->key.keycode, event->key.pressed);
+				input_sync(dev);
+			}
+			else {
+				pr_warning("unhandled keycode 0x%x\n", event->key.keycode);
+			}
+}
+
+
+/**
+ * Main handler for OpenXT PV input.
+ */
 static irqreturn_t input_handler(int rq, void *dev_id)
 {
-	struct openxt_kbd_info *info = dev_id;
-	struct xenkbd_page *page = info->page;
 	__u32 cons, prod;
 
+	//Get a reference to the device's information structure...
+	struct openxt_kbd_info *info = dev_id;
+
+	//... and get a reference to the shared page used for communications.
+	struct xenkbd_page *page = info->page;
+
+	//If we have the latest data from the ringbuffer, we're done!
 	prod = page->in_prod;
 	if (prod == page->in_cons)
 		return IRQ_HANDLED;
-	rmb();			/* ensure we see ring contents up to prod */
+
+	//Ensure that we always see the latest data.
+	rmb();
+
+	//For each outstanding event in the ringbuffer...
 	for (cons = page->in_cons; cons != prod; cons++) {
 		union xenkbd_in_event *event;
-		struct input_dev *dev;
-		event = &XENKBD_IN_RING_REF(page, cons);
 
-		dev = info->ptr;
+		//Get a reference to the current event.
+		event = &OXT_KBD_IN_RING_REF(page, cons);
+
 		switch (event->type) {
-		case XENKBD_TYPE_MOTION:
-			input_report_rel(dev, REL_X, event->motion.rel_x);
-			input_report_rel(dev, REL_Y, event->motion.rel_y);
-			if (event->motion.rel_z)
-				input_report_rel(dev, REL_WHEEL,
-						 -event->motion.rel_z);
+
+		case OXT_KBD_TYPE_MOTION:
+			__handle_relative_motion(info, event);
 			break;
-		case XENKBD_TYPE_KEY:
-			dev = NULL;
-			if (test_bit(event->key.keycode, info->kbd->keybit))
-				dev = info->kbd;
-			if (test_bit(event->key.keycode, info->ptr->keybit))
-				dev = info->ptr;
-			if (dev)
-				input_report_key(dev, event->key.keycode,
-						 event->key.pressed);
-			else
-				pr_warning("unhandled keycode 0x%x\n",
-					   event->key.keycode);
+
+		case OXT_KBD_TYPE_KEY:
+			__handle_key_or_button_press(info, event);
 			break;
-		case XENKBD_TYPE_POS:
-			dev = info->absolute_pointer;
-			input_report_abs(dev, ABS_X, event->pos.abs_x);
-			input_report_abs(dev, ABS_Y, event->pos.abs_y);
-			if (event->pos.rel_z)
-				input_report_rel(dev, REL_WHEEL,
-						 -event->pos.rel_z);
+
+		case OXT_KBD_TYPE_POS:
+			__handle_absolute_motion(info, event);
 			break;
 		}
-		if (dev)
-			input_sync(dev);
 	}
-	mb();			/* ensure we got ring contents */
-	page->in_cons = cons;
-	notify_remote_via_irq(info->irq);
 
+	//Free the relevant space in the ringbuffer...
+	mb();
+	page->in_cons = cons;
+
+	//... and signal to the other side that we're ready
+	//for more data.
+	notify_remote_via_irq(info->irq);
 	return IRQ_HANDLED;
 }
 
@@ -219,7 +297,7 @@ static int xenkbd_probe(struct xenbus_device *dev,
 		goto error_nomem;
 
 	//Finally, connect to the backend.
-	ret = xenkbd_connect_backend(dev, info);
+	ret = oxtkbd_connect_backend(dev, info);
 	if (ret < 0)
 		goto error;
 
@@ -229,7 +307,7 @@ static int xenkbd_probe(struct xenbus_device *dev,
 	ret = -ENOMEM;
 	xenbus_dev_fatal(dev, ret, "allocating device memory");
  error:
-	xenkbd_remove(dev);
+	oxtkbd_remove(dev);
 	return ret;
 }
 
@@ -237,16 +315,16 @@ static int xenkbd_resume(struct xenbus_device *dev)
 {
 	struct openxt_kbd_info *info = dev_get_drvdata(&dev->dev);
 
-	xenkbd_disconnect_backend(info);
+	oxtkbd_disconnect_backend(info);
 	memset(info->page, 0, PAGE_SIZE);
-	return xenkbd_connect_backend(dev, info);
+	return oxtkbd_connect_backend(dev, info);
 }
 
-static int xenkbd_remove(struct xenbus_device *dev)
+static int oxtkbd_remove(struct xenbus_device *dev)
 {
 	struct openxt_kbd_info *info = dev_get_drvdata(&dev->dev);
 
-	xenkbd_disconnect_backend(info);
+	oxtkbd_disconnect_backend(info);
 	if (info->kbd)
 		input_unregister_device(info->kbd);
 	if (info->ptr)
@@ -256,7 +334,7 @@ static int xenkbd_remove(struct xenbus_device *dev)
 	return 0;
 }
 
-static int xenkbd_connect_backend(struct xenbus_device *dev,
+static int oxtkbd_connect_backend(struct xenbus_device *dev,
 				  struct openxt_kbd_info *info)
 {
 	int ret, evtchn;
@@ -321,7 +399,7 @@ static int xenkbd_connect_backend(struct xenbus_device *dev,
 	return ret;
 }
 
-static void xenkbd_disconnect_backend(struct openxt_kbd_info *info)
+static void oxtkbd_disconnect_backend(struct openxt_kbd_info *info)
 {
 	if (info->irq >= 0)
 		unbind_from_irqhandler(info->irq, info);
@@ -399,7 +477,7 @@ static const struct xenbus_device_id xenkbd_ids[] = {
 static struct xenbus_driver xenkbd_driver = {
 	.ids = xenkbd_ids,
 	.probe = xenkbd_probe,
-	.remove = xenkbd_remove,
+	.remove = oxtkbd_remove,
 	.resume = xenkbd_resume,
 	.otherend_changed = xenkbd_backend_changed,
 };
