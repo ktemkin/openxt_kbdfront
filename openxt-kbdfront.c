@@ -113,26 +113,26 @@ static void __handle_absolute_motion(struct openxt_kbd_info *info,
 static void __handle_key_or_button_press(struct openxt_kbd_info *info, 
 		union xenkbd_in_event *event)
 {
-			struct input_dev *dev = NULL;
+	struct input_dev *dev = NULL;
 
-			//If this event is corresponds to a keyboard event, 
-			//send it via the keyboard device.
-			if (test_bit(event->key.keycode, info->kbd->keybit))
-				dev = info->kbd;
+	//If this event is corresponds to a keyboard event, 
+	//send it via the keyboard device.
+	if (test_bit(event->key.keycode, info->kbd->keybit))
+		dev = info->kbd;
 
-			//If it corresponds to a mouse event, send it via the mouse
-			//device. TODO: Possibly differentiate between ABS and REL presses?
-			if (test_bit(event->key.keycode, info->ptr->keybit))
-				dev = info->ptr;
+	//If it corresponds to a mouse event, send it via the mouse
+	//device. TODO: Possibly differentiate between ABS and REL presses?
+	if (test_bit(event->key.keycode, info->ptr->keybit))
+		dev = info->ptr;
 
-			//If we found a device to send the key via, send it!
-			if (dev) {
-				input_report_key(dev, event->key.keycode, event->key.pressed);
-				input_sync(dev);
-			}
-			else {
-				pr_warning("unhandled keycode 0x%x\n", event->key.keycode);
-			}
+	//If we found a device to send the key via, send it!
+	if (dev) {
+		input_report_key(dev, event->key.keycode, event->key.pressed);
+		input_sync(dev);
+	}
+	else {
+		pr_warning("unhandled keycode 0x%x\n", event->key.keycode);
+	}
 }
 
 
