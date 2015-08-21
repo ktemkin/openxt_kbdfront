@@ -12,7 +12,53 @@
  *  more details.
  */
 
+
+#include <linux/input/mt.h>
+
+#include <linux/kernel.h>
+#include <linux/errno.h>
+#include <linux/module.h>
+#include <linux/input.h>
+#include <linux/slab.h>
+
+#include <asm/xen/hypervisor.h>
+
+#include <xen/xen.h>
+#include <xen/events.h>
+#include <xen/page.h>
+#include <xen/grant_table.h>
+#include <xen/interface/grant_table.h>
+#include <xen/interface/io/fbif.h>
+#include <xen/interface/io/kbdif.h>
+#include <xen/xenbus.h>
+#include <xen/platform_pci.h>
+
 #include "oxt_kbdif.h"
+
+/**
+ * Data structure describing the OXT-KBD device state.
+ */
+struct openxt_kbd_info {
+
+	//The raw keyboard-- used to send key events.
+	struct input_dev *kbd;
+	struct input_dev *ptr;
+	
+	//The input device used to deliver any absolute events.
+	struct input_dev *absolute_pointer;
+
+	struct xenkbd_page *page;
+	int gref;
+	int irq;
+	struct xenbus_device *xbdev;
+	char phys[32];
+};
+
+//Forward declarations.
+static int  oxtkbd_remove(struct xenbus_device *);
+static int  oxtkbd_connect_backend(struct xenbus_device *, struct openxt_kbd_info *);
+static void oxtkbd_disconnect_backend(struct openxt_kbd_info *);
+
 
 /**
  * Handler for relative motion events.
@@ -78,7 +124,6 @@ static void __handle_touch_down(struct openxt_kbd_info *info,
 		input_report_key(info->absolute_pointer, BTN_TOUCH, 1);	
 	}
 }
-
 
 
 /**
@@ -454,7 +499,7 @@ static int oxtkbd_remove(struct xenbus_device *dev)
 	if (info->ptr)
 		input_unregister_device(info->ptr);
 	if (info->absolute_pointer)
-		input_unregister_device(info->ptr);
+		input_unregister_device(info->absolute_pointer);
 
 	//... free our shared page...
 	free_page((unsigned long)info->page);
