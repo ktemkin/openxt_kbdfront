@@ -119,10 +119,9 @@ static void __handle_touch_down(struct openxt_kbd_info *info,
 	input_mt_slot(info->absolute_pointer, event->touch_move.id);
 	input_mt_report_slot_state(info->absolute_pointer, MT_TOOL_FINGER, 1);
 
+	//TODO: Mouse emulation?
 	//If this was the first finger to be pressed, also send the button touch ID.
-	if(event->touch_move.id == 0) {
-		input_report_key(info->absolute_pointer, BTN_TOUCH, 1);	
-	}
+	//input_mt_report_pointer_emulation(input, true);
 }
 
 
@@ -183,7 +182,7 @@ static void __handle_touch_up(struct openxt_kbd_info *info,
 static void __handle_touch_framing(struct openxt_kbd_info *info, 
 		union oxtkbd_in_event *event) 
 {
-	input_sync(info->absolute_pointer);
+	input_mt_sync_frame(info->absolute_pointer);
 }
 
 /**
@@ -364,6 +363,9 @@ static struct input_dev * __allocate_pointer_device(struct openxt_kbd_info *info
 		
 		//Accept touches, as well.
 		input_set_capability(ptr, EV_KEY, BTN_TOUCH);
+
+		//And allow up to ten fingers of touch.
+		input_mt_init_slots(ptr, 10, INPUT_MT_POINTER | INPUT_MT_DIRECT | INPUT_MT_TRACK)
 	} 
 	//Otherwise, register it as providing relative ones.
 	else {
