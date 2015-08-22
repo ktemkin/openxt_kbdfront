@@ -118,10 +118,6 @@ static void __handle_touch_down(struct openxt_kbd_info *info,
 	//Send an indication that the given finger has been pressed...
 	input_mt_slot(info->absolute_pointer, event->touch_move.id);
 	input_mt_report_slot_state(info->absolute_pointer, MT_TOOL_FINGER, 1);
-
-	//TODO: Mouse emulation?
-	//If this was the first finger to be pressed, also send the button touch ID.
-	//input_mt_report_pointer_emulation(input, true);
 }
 
 
@@ -133,21 +129,24 @@ static void __handle_touch_down(struct openxt_kbd_info *info,
  * @param event The touch event to be handled.
  */
 static void __handle_touch_movement(struct openxt_kbd_info *info, 
-		union oxtkbd_in_event *event) 
+		union oxtkbd_in_event *event, int report_slot, int send_abs_event) 
 {
 	//Send the slot number, which determines which "finger" is providing
 	//the touch event.
-	input_mt_slot(info->absolute_pointer, event->touch_move.id);
+	if(report_slot)
+		input_mt_slot(info->absolute_pointer, event->touch_move.id);
 
 	//... the multi-touch coordinates...
 	input_report_abs(info->absolute_pointer, ABS_MT_POSITION_X, event->touch_move.abs_x);
 	input_report_abs(info->absolute_pointer, ABS_MT_POSITION_Y, event->touch_move.abs_y);
 
-	//... and the regular touch coordinates.
-	//TODO: Determine when to send these?
-	input_report_abs(info->absolute_pointer, ABS_X, event->touch_move.abs_x);
-	input_report_abs(info->absolute_pointer, ABS_Y, event->touch_move.abs_y);
-
+  //... and absolute touch points, if desired.
+  //Note that we only send the absolute touch events for slot zero-- the other "fingers"
+  //only send multi-touch events!
+  if(send_abs_event && (event->touch_move.id == 0)) {
+    input_report_abs(info->absolute_pointer, ABS_X, event->touch_move.abs_x);
+    input_report_abs(info->absolute_pointer, ABS_Y, event->touch_move.abs_y);
+  }
 }
 
 
@@ -164,11 +163,6 @@ static void __handle_touch_up(struct openxt_kbd_info *info,
 	//Send an indication that the given finger has been pressed...
 	input_mt_slot(info->absolute_pointer, event->touch_move.id);
 	input_mt_report_slot_state(info->absolute_pointer, MT_TOOL_FINGER, 0);
-
-	//If this was the first finger to be pressed, also send the button touch ID.
-	if(event->touch_move.id == 0) {
-		input_report_key(info->absolute_pointer, BTN_TOUCH, 0);	
-	}
 }
 
 
@@ -182,7 +176,8 @@ static void __handle_touch_up(struct openxt_kbd_info *info,
 static void __handle_touch_framing(struct openxt_kbd_info *info, 
 		union oxtkbd_in_event *event) 
 {
-	input_mt_sync_frame(info->absolute_pointer);
+  input_mt_sync_frame(info->absolute_pointer);
+	input_sync(info->absolute_pointer);;
 }
 
 /**
@@ -262,6 +257,7 @@ static irqreturn_t input_handler(int rq, void *dev_id)
 
 		case OXT_KBD_TYPE_TOUCH_DOWN:
 			__handle_touch_down(info, event);
+      __handle_touch_movement(info, event, false, false);
 			break;
 
 		case OXT_KBD_TYPE_TOUCH_UP:
@@ -269,7 +265,7 @@ static irqreturn_t input_handler(int rq, void *dev_id)
 			break;
 
 		case OXT_KBD_TYPE_TOUCH_MOVE:
-			__handle_touch_movement(info, event);
+			__handle_touch_movement(info, event, true, false);
 			break;
 
 		case OXT_KBD_TYPE_TOUCH_FRAME:
@@ -338,7 +334,7 @@ static struct input_dev * __allocate_keyboard_device(struct openxt_kbd_info *inf
  * @param name The new device's name, as reported to the user.
  */ 
 static struct input_dev * __allocate_pointer_device(struct openxt_kbd_info *info, 
-		char * name, int is_absolute)
+		char * name, int is_absolute, int is_multitouch)
 {
 	int i, ret;
 	struct input_dev *ptr = input_allocate_device();
@@ -360,12 +356,17 @@ static struct input_dev * __allocate_pointer_device(struct openxt_kbd_info *info
 		__set_bit(EV_ABS, ptr->evbit);
 		input_set_abs_params(ptr, ABS_X, 0, XENFB_WIDTH, 0, 0);
 		input_set_abs_params(ptr, ABS_Y, 0, XENFB_HEIGHT, 0, 0);
-		
-		//Accept touches, as well.
-		input_set_capability(ptr, EV_KEY, BTN_TOUCH);
 
-		//And allow up to ten fingers of touch.
-		input_mt_init_slots(ptr, 10, INPUT_MT_POINTER | INPUT_MT_DIRECT | INPUT_MT_TRACK)
+    if(is_multitouch) {
+      input_set_abs_params(ptr, ABS_MT_POSITION_X, 0, XENFB_WIDTH, 0, 0);
+      input_set_abs_params(ptr, ABS_MT_POSITION_Y, 0, XENFB_HEIGHT, 0, 0);
+      
+      //Accept touches, as well.
+      input_set_capability(ptr, EV_KEY, BTN_TOUCH);
+
+      //And allow up to ten fingers of touch.
+      input_mt_init_slots(ptr, 10, INPUT_MT_DIRECT);
+    }
 	} 
 	//Otherwise, register it as providing relative ones.
 	else {
@@ -377,9 +378,12 @@ static struct input_dev * __allocate_pointer_device(struct openxt_kbd_info *info
 	input_set_capability(ptr, EV_REL, REL_WHEEL);
 
 	//Mark this device as providing the typical mouse keys.
-	__set_bit(EV_KEY, ptr->evbit);
-	for (i = BTN_LEFT; i <= BTN_TASK; i++)
-		__set_bit(i, ptr->keybit);
+  if(!is_multitouch) {
+    __set_bit(EV_KEY, ptr->evbit);
+
+    for (i = BTN_LEFT; i <= BTN_TASK; i++)
+      __set_bit(i, ptr->keybit);
+  }
 
 	//Finally, register the new input device with evdev.
 	ret = input_register_device(ptr);
@@ -436,12 +440,12 @@ static int oxtkbd_probe(struct xenbus_device *dev, const struct xenbus_device_id
 		goto error_nomem;
 
 	//Allocate a new relative pointer, for our relative events...
-	info->ptr = __allocate_pointer_device(info, "Xen Relative Pointer", false);
+	info->ptr = __allocate_pointer_device(info, "Xen Relative Pointer", false, false);
 	if(!info->ptr)
 		goto error_nomem;
 
 	//...and an absolute pointer for our absolute ones.
-	info->absolute_pointer = __allocate_pointer_device(info, "Xen Absolute Pointer", true);
+	info->absolute_pointer = __allocate_pointer_device(info, "Xen Absolute Pointer", true, true);
 	if(!info->absolute_pointer)
 		goto error_nomem;
 
@@ -500,8 +504,10 @@ static int oxtkbd_remove(struct xenbus_device *dev)
 		input_unregister_device(info->kbd);
 	if (info->ptr)
 		input_unregister_device(info->ptr);
-	if (info->absolute_pointer)
+	if (info->absolute_pointer) {
+    input_mt_destroy_slots(info->absolute_pointer);
 		input_unregister_device(info->absolute_pointer);
+  }
 
 	//... free our shared page...
 	free_page((unsigned long)info->page);
