@@ -372,10 +372,11 @@ static struct input_dev * __allocate_pointer_device(struct openxt_kbd_info *info
 	else {
 		input_set_capability(ptr, EV_REL, REL_X);
 		input_set_capability(ptr, EV_REL, REL_Y);
-	}
+  }
 
-	//Either way, allow wheel input to be provided.
-	input_set_capability(ptr, EV_REL, REL_WHEEL);
+  //Enable scroll events on non-multitouch displays.
+  if(!is_multitouch) 
+    input_set_capability(ptr, EV_REL, REL_WHEEL);
 
 	//Mark this device as providing the typical mouse keys.
   if(!is_multitouch) {
