@@ -55,10 +55,10 @@
  * Careful not to change the ordering-- id must be the second element!
  */
 struct oxtkbd_touch_down {
-		uint8_t type;   /* OXT_KBD_TYPE_TOUCH_DOWN */
-		int32_t id;     /* the finger identifier for a touch event */
-   	int32_t abs_x;	/* absolute X position (in FB pixels) */
-  	int32_t abs_y;	/* absolute Y position (in FB pixels) */
+        uint8_t type;   /* OXT_KBD_TYPE_TOUCH_DOWN */
+        int32_t id;     /* the finger identifier for a touch event */
+    int32_t abs_x;  /* absolute X position (in FB pixels) */
+    int32_t abs_y;  /* absolute Y position (in FB pixels) */
 };
 
 /**
@@ -66,8 +66,8 @@ struct oxtkbd_touch_down {
  * Careful not to change the ordering-- id must be the second element!
  */
 struct oxtkbd_touch_up {
-		uint8_t type;   /* OXT_KBD_TYPE_TOUCH_UP */
-		int32_t id;     /* the finger identifier for a touch event */
+        uint8_t type;   /* OXT_KBD_TYPE_TOUCH_UP */
+        int32_t id;     /* the finger identifier for a touch event */
 };
 
 /**
@@ -75,10 +75,10 @@ struct oxtkbd_touch_up {
  * Careful not to change the ordering-- id must be the second element!
  */
 struct oxtkbd_touch_move {
-		uint8_t type;   /* OXT_KBD_TYPE_TOUCH_MOVE */
-		int32_t id;     /* the finger identifier for a touch event */
-   	int32_t abs_x;	/* absolute X position (in FB pixels) */
-  	int32_t abs_y;	/* absolute Y position (in FB pixels) */
+        uint8_t type;   /* OXT_KBD_TYPE_TOUCH_MOVE */
+        int32_t id;     /* the finger identifier for a touch event */
+    int32_t abs_x;  /* absolute X position (in FB pixels) */
+    int32_t abs_y;  /* absolute Y position (in FB pixels) */
 };
 
 
@@ -86,7 +86,7 @@ struct oxtkbd_touch_move {
  * Packet describing a touch movement event.
  */
 struct oxtkbd_touch_frame {
-		uint8_t type;   /* OXT_KBD_TYPE_TOUCH_FRAME */
+        uint8_t type;   /* OXT_KBD_TYPE_TOUCH_FRAME */
 };
 
 #define OXT_KBD_IN_EVENT_SIZE 40
@@ -97,21 +97,21 @@ struct oxtkbd_touch_frame {
  */
 union oxtkbd_in_event {
 
-	//Do not edit the entries below; 
-	//they're necessary for backwards compatibility.
-	uint8_t type;
-	struct xenkbd_motion motion;
-	struct xenkbd_key key;
-	struct xenkbd_position pos;
+    //Do not edit the entries below;
+    //they're necessary for backwards compatibility.
+    uint8_t type;
+    struct xenkbd_motion motion;
+    struct xenkbd_key key;
+    struct xenkbd_position pos;
 
-	//New event types for OpenXT.
-	//Multitouch:
-	struct oxtkbd_touch_down   touch_down;
-	struct oxtkbd_touch_move   touch_move;
-	struct oxtkbd_touch_up     touch_up;
-	struct oxtkbd_touch_frame  touch_frame;
+    //New event types for OpenXT.
+    //Multitouch:
+    struct oxtkbd_touch_down   touch_down;
+    struct oxtkbd_touch_move   touch_move;
+    struct oxtkbd_touch_up     touch_up;
+    struct oxtkbd_touch_frame  touch_frame;
 
-	char pad[OXT_KBD_IN_EVENT_SIZE];
+    char pad[OXT_KBD_IN_EVENT_SIZE];
 };
 
 /* shared page */
@@ -120,8 +120,8 @@ union oxtkbd_in_event {
 #define OXT_KBD_IN_RING_LEN (XENKBD_IN_RING_SIZE / XENKBD_IN_EVENT_SIZE)
 #define OXT_KBD_IN_RING_OFFS 1024
 #define OXT_KBD_IN_RING(page) \
-	((union oxtkbd_in_event *)((char *)(page) + OXT_KBD_IN_RING_OFFS))
+    ((union oxtkbd_in_event *)((char *)(page) + OXT_KBD_IN_RING_OFFS))
 #define OXT_KBD_IN_RING_REF(page, idx) \
-	(OXT_KBD_IN_RING((page))[(idx) % XENKBD_IN_RING_LEN])
+    (OXT_KBD_IN_RING((page))[(idx) % XENKBD_IN_RING_LEN])
 
 #endif
