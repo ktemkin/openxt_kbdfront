@@ -26,6 +26,12 @@
 #ifndef __OPENXTFB_KBDIF_H__
 #define __OPENXTFB_KBDIF_H__
 
+/**
+ * The default maximum for ABS_X and ABS_Y events. Can be overridden at
+ * module load time.
+ */
+#define OXT_KBD_ABS_MAX     32767
+
 /*
  * Frontends should ignore unknown in events.
  */
@@ -55,8 +61,8 @@
  * Careful not to change the ordering-- id must be the second element!
  */
 struct oxtkbd_touch_down {
-        uint8_t type;   /* OXT_KBD_TYPE_TOUCH_DOWN */
-        int32_t id;     /* the finger identifier for a touch event */
+    uint8_t type;   /* OXT_KBD_TYPE_TOUCH_DOWN */
+    int32_t id;     /* the finger identifier for a touch event */
     int32_t abs_x;  /* absolute X position (in FB pixels) */
     int32_t abs_y;  /* absolute Y position (in FB pixels) */
 };
@@ -66,8 +72,8 @@ struct oxtkbd_touch_down {
  * Careful not to change the ordering-- id must be the second element!
  */
 struct oxtkbd_touch_up {
-        uint8_t type;   /* OXT_KBD_TYPE_TOUCH_UP */
-        int32_t id;     /* the finger identifier for a touch event */
+    uint8_t type;   /* OXT_KBD_TYPE_TOUCH_UP */
+    int32_t id;     /* the finger identifier for a touch event */
 };
 
 /**
@@ -75,8 +81,8 @@ struct oxtkbd_touch_up {
  * Careful not to change the ordering-- id must be the second element!
  */
 struct oxtkbd_touch_move {
-        uint8_t type;   /* OXT_KBD_TYPE_TOUCH_MOVE */
-        int32_t id;     /* the finger identifier for a touch event */
+    uint8_t type;   /* OXT_KBD_TYPE_TOUCH_MOVE */
+    int32_t id;     /* the finger identifier for a touch event */
     int32_t abs_x;  /* absolute X position (in FB pixels) */
     int32_t abs_y;  /* absolute Y position (in FB pixels) */
 };
@@ -86,7 +92,7 @@ struct oxtkbd_touch_move {
  * Packet describing a touch movement event.
  */
 struct oxtkbd_touch_frame {
-        uint8_t type;   /* OXT_KBD_TYPE_TOUCH_FRAME */
+    uint8_t type;   /* OXT_KBD_TYPE_TOUCH_FRAME */
 };
 
 #define OXT_KBD_IN_EVENT_SIZE 40

@@ -33,7 +33,20 @@
 #include <xen/xenbus.h>
 #include <xen/platform_pci.h>
 
-#include "oxt_kbdif.h"
+#include "openxt_kbdif.h"
+
+
+/**
+ * Default ABS_X/ABS_Y max: the default maximum value that the absolute input devices
+ * should accept. This effectively sets the maximum width and height transmitted
+ * via the shared ring.
+ */
+static int default_max_x = 32768;
+module_param(default_max_x, int, S_IRUGO);
+
+static int default_max_y = 32768;
+module_param(default_max_y, int, S_IRUGO);
+
 
 /**
  * Data structure describing the OXT-KBD device state.
@@ -41,15 +54,18 @@
 struct openxt_kbd_info {
 
     //The raw keyboard-- used to send key events.
-    struct input_dev *kbd;
-    struct input_dev *ptr;
+    struct input_dev *keyboard;
+    struct input_dev *relative_pointer;
 
     //The input device used to deliver any absolute events.
     struct input_dev *absolute_pointer;
 
-    struct xenkbd_page *page;
+    // Information about the current connection to the backend domain,
+    // including the grant reference and event channel IRQ.
     int gref;
     int irq;
+    struct xenkbd_page *page;
+
     struct xenbus_device *xbdev;
     char phys[32];
 };
@@ -71,15 +87,15 @@ static void __handle_relative_motion(struct openxt_kbd_info *info,
         union oxtkbd_in_event *event)
 {
     //Pass the relative movement on to evdev.
-    input_report_rel(info->ptr, REL_X, event->motion.rel_x);
-    input_report_rel(info->ptr, REL_Y, event->motion.rel_y);
+    input_report_rel(info->relative_pointer, REL_X, event->motion.rel_x);
+    input_report_rel(info->relative_pointer, REL_Y, event->motion.rel_y);
 
     //If the event has a Z-axis motion (a scroll wheel event),
     //send that as well.
     if (event->motion.rel_z)
-        input_report_rel(info->ptr, REL_WHEEL, -event->motion.rel_z);
+        input_report_rel(info->relative_pointer, REL_WHEEL, -event->motion.rel_z);
 
-    input_sync(info->ptr);
+    input_sync(info->relative_pointer);
 }
 
 
@@ -194,13 +210,13 @@ static void __handle_key_or_button_press(struct openxt_kbd_info *info,
 
     //If this event is corresponds to a keyboard event,
     //send it via the keyboard device.
-    if (test_bit(event->key.keycode, info->kbd->keybit))
-        dev = info->kbd;
+    if (test_bit(event->key.keycode, info->keyboard->keybit))
+        dev = info->keyboard;
 
     //If it corresponds to a mouse event, send it via the mouse
     //device. TODO: Possibly differentiate between ABS and REL presses?
-    if (test_bit(event->key.keycode, info->ptr->keybit))
-        dev = info->ptr;
+    if (test_bit(event->key.keycode, info->relative_pointer->keybit))
+        dev = info->relative_pointer;
 
     //If we found a device to send the key via, send it!
     if (dev) {
@@ -354,12 +370,12 @@ static struct input_dev * __allocate_pointer_device(struct openxt_kbd_info *info
     //of absolute events.
     if (is_absolute) {
         __set_bit(EV_ABS, ptr->evbit);
-        input_set_abs_params(ptr, ABS_X, 0, XENFB_WIDTH, 0, 0);
-        input_set_abs_params(ptr, ABS_Y, 0, XENFB_HEIGHT, 0, 0);
+        input_set_abs_params(ptr, ABS_X, 0, default_max_x, 0, 0);
+        input_set_abs_params(ptr, ABS_Y, 0, default_max_y, 0, 0);
 
         if (is_multitouch) {
-            input_set_abs_params(ptr, ABS_MT_POSITION_X, 0, XENFB_WIDTH, 0, 0);
-            input_set_abs_params(ptr, ABS_MT_POSITION_Y, 0, XENFB_HEIGHT, 0, 0);
+            input_set_abs_params(ptr, ABS_MT_POSITION_X, 0, default_max_x, 0, 0);
+            input_set_abs_params(ptr, ABS_MT_POSITION_Y, 0, default_max_y, 0, 0);
 
             //Accept touches, as well.
             input_set_capability(ptr, EV_KEY, BTN_TOUCH);
@@ -436,13 +452,13 @@ static int oxtkbd_probe(struct xenbus_device *dev, const struct xenbus_device_id
 
     //Allocate a new keyboard device, which will handle all keypresses and
     //button presses.
-    info->kbd = __allocate_keyboard_device(info, "Xen Virtual Keyboard");
-    if (!info->kbd)
+    info->keyboard = __allocate_keyboard_device(info, "Xen Virtual Keyboard");
+    if (!info->keyboard)
         goto error_nomem;
 
     //Allocate a new relative pointer, for our relative events...
-    info->ptr = __allocate_pointer_device(info, "Xen Relative Pointer", false, false);
-    if (!info->ptr)
+    info->relative_pointer = __allocate_pointer_device(info, "Xen Relative Pointer", false, false);
+    if (!info->relative_pointer)
         goto error_nomem;
 
     //...and an absolute pointer for our absolute ones.
@@ -501,10 +517,10 @@ static int oxtkbd_remove(struct xenbus_device *dev)
     oxtkbd_disconnect_backend(info);
 
     //...tear down each of our actual input devices...
-    if (info->kbd)
-        input_unregister_device(info->kbd);
-    if (info->ptr)
-        input_unregister_device(info->ptr);
+    if (info->keyboard)
+        input_unregister_device(info->keyboard);
+    if (info->relative_pointer)
+        input_unregister_device(info->relative_pointer);
     if (info->absolute_pointer) {
         input_mt_destroy_slots(info->absolute_pointer);
         input_unregister_device(info->absolute_pointer);
@@ -678,12 +694,16 @@ InitWait:
         //Once we connect, try to adjust the screen width and height
         //to match the width and height stored in the XenStore.
         if (xenbus_scanf(XBT_NIL, info->xbdev->otherend,
-                 "width", "%d", &val) > 0)
-            input_set_abs_params(info->ptr, ABS_X, 0, val, 0, 0);
+                 "width", "%d", &val) > 0) {
+            input_set_abs_params(info->absolute_pointer, ABS_X, 0, val, 0, 0);
+            input_set_abs_params(info->absolute_pointer, ABS_MT_POSITION_X, 0, val, 0, 0);
+        }
 
         if (xenbus_scanf(XBT_NIL, info->xbdev->otherend,
-                 "height", "%d", &val) > 0)
-            input_set_abs_params(info->ptr, ABS_Y, 0, val, 0, 0);
+                 "height", "%d", &val) > 0) {
+            input_set_abs_params(info->absolute_pointer, ABS_Y, 0, val, 0, 0);
+            input_set_abs_params(info->absolute_pointer, ABS_MT_POSITION_Y, 0, val, 0, 0);
+        }
 
         break;
 
